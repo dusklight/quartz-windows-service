@@ -1,0 +1,78 @@
+name: Build Quartz Windows Service
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write # Needed for publishing releases.  See https://github.com/softprops/action-gh-release/issues/236
+    defaults:
+      run:
+        shell: pwsh # (Already the default for windows runners.)
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Install .NET
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: 7.0.x
+
+    - name: Dotnet restore
+      run: dotnet restore
+      
+    - name: Run dotnet format, verify only
+      run: dotnet format --verify-no-changes --verbosity detailed --no-restore
+
+    - name: Create version strings
+      run: |
+        $BUILD_TIMESTAMP = Get-Date -Format "yyyy-MM-ddTHH-mm-ss"
+        echo "Build Timestamp: $BUILD_TIMESTAMP"
+
+        $SHORT_COMMIT_HASH = $ENV:GITHUB_SHA.Substring(0, 7)
+        echo "Short Commit Hash: $SHORT_COMMIT_HASH"
+
+        $COMPLETE_VERSION_STRING = "${{vars.MAJOR_VERSION_NUMBER}}.${{vars.MINOR_VERSION_NUMBER}}.${{vars.PATCH_VERSION_NUMBER}}-$ENV:GITHUB_RUN_NUMBER+$BUILD_TIMESTAMP.$SHORT_COMMIT_HASH"
+        echo "Complete Version String: $COMPLETE_VERSION_STRING"
+
+        $FILE_VERSION_STRING = "${{vars.MAJOR_VERSION_NUMBER}}.${{vars.MINOR_VERSION_NUMBER}}.${{vars.PATCH_VERSION_NUMBER}}.$ENV:GITHUB_RUN_NUMBER"
+        echo "File Version String: $FILE_VERSION_STRING"
+
+        echo "BUILD_TIMESTAMP=$BUILD_TIMESTAMP" >> "$ENV:GITHUB_ENV"
+        echo "SHORT_COMMIT_HASH=$SHORT_COMMIT_HASH" >> "$ENV:GITHUB_ENV"
+        echo "COMPLETE_VERSION_STRING=$COMPLETE_VERSION_STRING" >> "$ENV:GITHUB_ENV"
+        echo "FILE_VERSION_STRING=$FILE_VERSION_STRING" >> "$ENV:GITHUB_ENV"
+        
+    - name: Build
+      run: |
+        dotnet build --no-restore -c ${{vars.BUILD_CONFIGURATION}} /p:InformationalVersion="$ENV:COMPLETE_VERSION_STRING" /p:FileVersion="$ENV:FILE_VERSION_STRING"
+        Compress-Archive -Path src\QuartzWindowsServiceApp\bin\Release\net7.0 -DestinationPath .\${{vars.BUILD_CONFIGURATION}}BuildOutput.zip
+    
+    - name: Run unit tests
+      run: dotnet test --no-restore -c ${{vars.BUILD_CONFIGURATION}} --collect "XPlat Code coverage" --results-directory test-coverage
+
+    - name: Generate code coverage report
+      run: |       
+        dotnet tool install -g dotnet-reportgenerator-globaltool
+        # Note about "**" below: we have only one project for coverage.  If we had multiple projects, it will have multiple folders with different GUID.
+        reportgenerator -reports:".\test-coverage\**\coverage.cobertura.xml" -targetdir:"coverage-report" -reporttypes:Html -assemblyfilters:"-xunit*"
+        Compress-Archive -Path .\coverage-report -DestinationPath .\coverage-report.zip
+
+    - name: Create Inno Setup package
+      run: iscc /O"InnoSetupPackage" /F"SetupQuartzWindowsService-$ENV:FILE_VERSION_STRING" /DBuildConfiguration=${{vars.BUILD_CONFIGURATION}} /DSetupProductVersion=$ENV:COMPLETE_VERSION_STRING /DSetupFileVersion=$ENV:FILE_VERSION_STRING .\InnoSetupPackage.iss
+
+    - name: Create GitHub release
+      uses: softprops/action-gh-release@v0.1.15
+      with:
+        tag_name: ${{env.COMPLETE_VERSION_STRING}}
+        body: Automated build release from GitHub Actions
+        files: |
+          ${{vars.BUILD_CONFIGURATION}}BuildOutput.zip
+          InnoSetupPackage/*
+          coverage-report.zip
